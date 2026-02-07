@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import ast
 import numpy as np
 import pandas as pd
 
@@ -21,9 +22,48 @@ FEATURE_COLS = [
     "plot_rating",
 ]
 
-# Feature order:
-# [cinematography, direction, pacing_adj, music, plot]
 N_FEATURES = 5
+
+
+# -------------------------------
+# GENRE PARSING
+# -------------------------------
+def _clean_genre_token(g: Any) -> str:
+    """Normalize one genre token to improve matching."""
+    return str(g).strip().strip('"').strip("'").strip()
+
+def parse_genres(x: Any) -> List[str]:
+    """
+    Supports:
+    - "Drama|Action"
+    - "['Drama', 'Action']"  (stringified Python list)
+    - '["Drama", "Action"]'  (stringified JSON-like list)
+    """
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return []
+
+    if isinstance(x, list):
+        return [_clean_genre_token(g) for g in x if _clean_genre_token(g)]
+
+    if not isinstance(x, str):
+        return []
+
+    s = x.strip()
+    if not s:
+        return []
+
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, list):
+                return [_clean_genre_token(g) for g in parsed if _clean_genre_token(g)]
+        except Exception:
+            pass
+
+    if "|" in s:
+        return [_clean_genre_token(g) for g in s.split("|") if _clean_genre_token(g)]
+
+    return [_clean_genre_token(s)]
 
 
 # -------------------------------
@@ -31,12 +71,12 @@ N_FEATURES = 5
 # -------------------------------
 def load_movies(filepath: str | Path = DEFAULT_DATA_PATH) -> pd.DataFrame:
     """
-    Loads movie dataset and prepares genres column (pipe-separated -> list[str]).
+    Loads movie dataset and prepares genres column.
     """
     fp = Path(filepath)
     df = pd.read_csv(fp)
 
-    df["genres"] = df["genres"].apply(lambda x: x.split("|") if isinstance(x, str) else [])
+    df["genres"] = df["genres"].apply(parse_genres)
 
     required = {"id", "title", "genres", *FEATURE_COLS}
     missing = required - set(df.columns)
@@ -50,24 +90,16 @@ def load_movies(filepath: str | Path = DEFAULT_DATA_PATH) -> pd.DataFrame:
 # MASKING + NORMALIZATION
 # -------------------------------
 def mask_from_user_weights(user_weights: List[Optional[float]]) -> np.ndarray:
-    """True where criterion is considered important; False where user set None."""
     if len(user_weights) != N_FEATURES:
         raise ValueError(f"user_weights must have length {N_FEATURES}")
     return np.array([w is not None for w in user_weights], dtype=bool)
 
-
 def apply_mask(vector: np.ndarray, user_weights: List[Optional[float]]) -> np.ndarray:
-    """Zero-out dimensions the user marked as unimportant (None)."""
     v = np.array(vector, dtype=float)
     m = mask_from_user_weights(user_weights).astype(float)
     return v * m
 
-
 def normalize_weights(user_weights: List[Optional[float]]) -> np.ndarray:
-    """
-    Normalizes importance rankings into weights that sum to 1.
-    Supports None -> treated as 0 (excluded).
-    """
     weights = np.array([w if w is not None else 0.0 for w in user_weights], dtype=float)
     s = float(weights.sum())
     if s <= 0:
@@ -79,24 +111,15 @@ def normalize_weights(user_weights: List[Optional[float]]) -> np.ndarray:
 # PACING
 # -------------------------------
 def adjust_pacing(movie_pacing: float, pacing_pref: str) -> float:
-    """
-    pacing_rating scale = 1..5
-    1 = very slow
-    5 = very fast
-    """
     if str(pacing_pref).lower() == "fast":
         return float(movie_pacing)
-    return float(6 - movie_pacing)  # flip for "slow"
+    return float(6 - movie_pacing)
 
 
 # -------------------------------
 # VECTORS + SIMILARITY
 # -------------------------------
 def movie_vector(row: pd.Series, pacing_pref: str) -> np.ndarray:
-    """
-    Returns movie's 5D feature vector with pacing adjusted for user preference.
-    Order: [cinematography, direction, pacing_adj, music, plot]
-    """
     pacing_score = adjust_pacing(row["pacing_rating"], pacing_pref)
     return np.array(
         [
@@ -109,30 +132,34 @@ def movie_vector(row: pd.Series, pacing_pref: str) -> np.ndarray:
         dtype=float,
     )
 
-
 def cosine_similarity(a: np.ndarray, b: np.ndarray, eps: float = 1e-9) -> float:
     a = np.array(a, dtype=float)
     b = np.array(b, dtype=float)
     denom = (np.linalg.norm(a) * np.linalg.norm(b)) + eps
     return float(np.dot(a, b) / denom)
 
-
 def compute_genre_score(movie_genres: List[str], user_genres: List[str]) -> float:
-    """Score = fraction of user's preferred genres present in the movie."""
-    if not user_genres:
+    """
+    Binary genre match:
+    - 1.0 if movie matches ANY preferred genre
+    - 0.0 otherwise
+    """
+    if not user_genres or not movie_genres:
         return 0.0
-    matches = len(set(movie_genres) & set(user_genres))
-    return matches / len(set(user_genres))
+
+    mg = {_clean_genre_token(g).lower() for g in movie_genres}
+    ug = {_clean_genre_token(g).lower() for g in user_genres}
+
+    return 1.0 if mg & ug else 0.0
+
 
 
 # -------------------------------
 # LEARNING
 # -------------------------------
 def dynamic_beta(n_likes: int, K: int = 5) -> float:
-    """beta(n) = K / (K + n)"""
     n = max(0, int(n_likes))
     return K / (K + n)
-
 
 def learned_profile_from_ratings(
     df: pd.DataFrame,
@@ -140,10 +167,6 @@ def learned_profile_from_ratings(
     pacing_pref: str,
     like_threshold: int = 4,
 ) -> Tuple[Optional[np.ndarray], int, List[np.ndarray]]:
-    """
-    Learned profile = average of feature vectors of liked movies.
-    Returns: (learned_profile or None, n_likes, liked_vectors)
-    """
     if not ratings:
         return None, 0, []
 
@@ -160,59 +183,39 @@ def learned_profile_from_ratings(
     learned = np.mean(np.vstack(liked_vectors), axis=0)
     return learned, n_likes, liked_vectors
 
-
 def learned_importance_from_likes(liked_vectors: List[np.ndarray], user_weights: List[Optional[float]]) -> Optional[np.ndarray]:
-    """
-    Learn which criteria matter based on liked movies' feature patterns.
-    Returns normalized importance weights (sum=1) on allowed dimensions.
-    """
     if not liked_vectors:
         return None
-
     avg = np.mean(np.vstack(liked_vectors), axis=0)
     avg = apply_mask(avg, user_weights)
-
     s = float(avg.sum())
     if s <= 0:
         return None
     return avg / s
 
-
 def blend_importance_weights(baseline_w: np.ndarray, learned_w: Optional[np.ndarray], n_likes: int, K: int = 5) -> np.ndarray:
-    """final_w = gamma*baseline_w + (1-gamma)*learned_w"""
     if learned_w is None:
         return baseline_w
     gamma = dynamic_beta(n_likes, K=K)
     return gamma * baseline_w + (1 - gamma) * learned_w
 
-
 def blended_user_profile(baseline: np.ndarray, learned: Optional[np.ndarray], n_likes: int, K: int = 5) -> Tuple[np.ndarray, float]:
-    """Option C: final_profile = beta*baseline + (1-beta)*learned"""
     if learned is None:
         return baseline, 1.0
     beta = dynamic_beta(n_likes, K=K)
     return beta * baseline + (1 - beta) * learned, beta
 
-
 def discovery_user_profile(user_profile: np.ndarray, user_weights: List[Optional[float]], ideal_rating: float = 5.0, alpha: float = 0.85) -> np.ndarray:
-    """
-    Softens user profile toward a neutral vector on allowed dimensions.
-    """
     user_profile = np.array(user_profile, dtype=float)
     m = mask_from_user_weights(user_weights)
-
     neutral = np.zeros_like(user_profile)
     if m.any():
         neutral[m] = float(ideal_rating) / int(m.sum())
-
     return alpha * user_profile + (1 - alpha) * neutral
 
-
 def safe_nonzero_profile(user_profile: np.ndarray, user_weights: List[Optional[float]], ideal_rating: float = 5.0) -> np.ndarray:
-    """Guard against all-zero vectors (cosine similarity degeneracy)."""
     if np.linalg.norm(user_profile) != 0:
         return user_profile
-
     m = mask_from_user_weights(user_weights)
     fallback = np.zeros_like(user_profile, dtype=float)
     if m.any():
@@ -243,14 +246,11 @@ def recommend(
     pacing_pref: str = "fast",
     discovery_mode: bool = False,
     top_n: int = 10,
-    ratings: Optional[Dict[int, float]] = None,  # {movie_id: rating}
+    ratings: Optional[Dict[int, float]] = None,
     like_threshold: int = 4,
     K: int = 5,
     ideal_rating: float = 5.0,
 ) -> Tuple[pd.DataFrame, RecommendMeta]:
-    """
-    returns (recommendations_df, meta)
-    """
 
     df = df.copy()
 
@@ -281,8 +281,9 @@ def recommend(
         return cosine_similarity(user_profile, x)
 
     df["relevance_score"] = df.apply(_relevance, axis=1)
-
     df["genre_score"] = df["genres"].apply(lambda g: compute_genre_score(g, preferred_genres))
+    df["genre_score"] = df["genre_score"].astype(float)
+    df["relevance_score"] = df["relevance_score"].astype(float)
 
     if discovery_mode:
         df["final_score"] = 0.9 * df["relevance_score"] + 0.1 * df["genre_score"]
@@ -292,7 +293,7 @@ def recommend(
     recs = df.sort_values("final_score", ascending=False).head(int(top_n))
 
     confidence = 0.4 + 0.6 * (n_likes / (n_likes + K))
-    
+
     meta = RecommendMeta(
         n_likes=int(n_likes),
         beta=float(beta),
