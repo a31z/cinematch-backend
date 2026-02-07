@@ -133,6 +133,7 @@ def movies():
         "tags",
         "overall",
         "pacing",
+        "director"
     ]
 
     safe_df = movies_df[cols].copy()
