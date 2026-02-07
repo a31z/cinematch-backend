@@ -7,6 +7,7 @@ __pycache__/
 
 # C extensions
 *.so
+storage/*.db
 
 # Distribution / packaging
 .Python
@@ -141,6 +142,9 @@ cython_debug/
 
 # gitignore template for Jupyter Notebooks
 # website: http://jupyter.org/
+.DS_Store
+.idea/
+.vscode/
 
 .ipynb_checkpoints
 */.ipynb_checkpoints/*
